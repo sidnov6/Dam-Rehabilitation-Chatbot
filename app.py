@@ -3,24 +3,17 @@ RAG chatbot for the Dam Rehabilitation Manual.
 Run: streamlit run app.py
 """
 
-import os, re, base64, shutil
+import os, re, base64, pickle
+import numpy as np
 import streamlit as st
-import chromadb
-from chromadb.utils import embedding_functions
+from fastembed import TextEmbedding
 from groq import Groq, RateLimitError
 from dotenv import load_dotenv
 
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
-# On cloud (read-only source dir) copy chroma_db to /tmp so ChromaDB can write lock files
-_SRC_CHROMA = os.path.join(os.path.dirname(__file__), "chroma_db")
-_TMP_CHROMA = "/tmp/dam_chroma_db"
-if not os.path.exists(_TMP_CHROMA) and os.path.exists(_SRC_CHROMA):
-    shutil.copytree(_SRC_CHROMA, _TMP_CHROMA)
-CHROMA_DIR = _TMP_CHROMA if os.path.exists(_TMP_CHROMA) else _SRC_CHROMA
-COLLECTION   = "dam_rehab_manual"
+INDEX_DIR    = os.path.join(os.path.dirname(__file__), "index")
 TOP_K        = 6
 MODEL        = "llama-3.3-70b-versatile"
 
@@ -322,17 +315,25 @@ details { border: 1px solid #E5E7EB !important; border-radius: 10px !important; 
 
 # ── Core functions ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading knowledge base...")
-def load_collection():
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    ef = embedding_functions.DefaultEmbeddingFunction()
-    return client.get_collection(name=COLLECTION, embedding_function=ef)
+def load_index():
+    embs = np.load(os.path.join(INDEX_DIR, "embeddings.npy"))
+    with open(os.path.join(INDEX_DIR, "metadata.pkl"), "rb") as f:
+        data = pickle.load(f)
+    model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+    # Precompute norms for cosine similarity
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    embs_norm = embs / (norms + 1e-8)
+    return embs_norm, data["documents"], data["metadatas"], model
 
 
-def retrieve_context(collection, query: str, top_k: int) -> tuple[str, list[int]]:
-    results = collection.query(query_texts=[query], n_results=top_k)
-    docs, metas = results["documents"][0], results["metadatas"][0]
-    pages = sorted({m["page"] for m in metas})
-    parts = [f"[Page {m['page']}]\n{d}" for d, m in zip(docs, metas)]
+def retrieve_context(query: str, top_k: int) -> tuple[str, list[int]]:
+    embs_norm, docs, metas, model = load_index()
+    q_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
+    q_emb /= np.linalg.norm(q_emb) + 1e-8
+    sims = embs_norm @ q_emb
+    top_idx = np.argsort(sims)[-top_k:][::-1]
+    pages = sorted({metas[i]["page"] for i in top_idx})
+    parts = [f"[Page {metas[i]['page']}]\n{docs[i]}" for i in top_idx]
     return "\n\n---\n\n".join(parts), pages
 
 
@@ -351,13 +352,13 @@ def chat_with_groq(api_key, history, context, question):
     return resp.choices[0].message.content
 
 
-def handle_prompt(prompt, collection, top_k, show_sources):
+def handle_prompt(prompt, top_k, show_sources):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"):
         with st.spinner("Searching manual..."):
-            ctx, pages = retrieve_context(collection, prompt, top_k)
+            ctx, pages = retrieve_context(prompt, top_k)
             history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
             try:
                 answer = chat_with_groq(GROQ_API_KEY, history, ctx, prompt)
@@ -422,9 +423,9 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 # ── Load resources ────────────────────────────────────────────────────────────
 try:
-    collection = load_collection()
+    load_index()  # warm the cache; errors surface here before any user input
 except Exception as e:
-    st.error(f"Knowledge base not found. Run `python3 ingest.py` first.\n\n{e}")
+    st.error(f"Index not found. Run `python3 ingest.py` then `python3 build_index.py` first.\n\n{e}")
     st.stop()
 
 if not GROQ_API_KEY:
@@ -447,7 +448,7 @@ with st.sidebar:
     show_sources = st.toggle("Show source excerpts", value=False)
 
     st.markdown("---")
-    st.markdown(f"📚 **{collection.count()} chunks** indexed  \n🤖 `{MODEL}`  \n📄 290 pages")
+    st.markdown(f"📚 **887 chunks** indexed  \n🤖 `{MODEL}`  \n📄 290 pages")
 
     st.markdown("---")
     if st.button("🗑️ Clear chat", use_container_width=True):
@@ -497,10 +498,10 @@ else:
 if st.session_state.queued_prompt:
     p = st.session_state.queued_prompt
     st.session_state.queued_prompt = None
-    handle_prompt(p, collection, top_k, show_sources)
+    handle_prompt(p, top_k, show_sources)
     st.rerun()
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 if p := st.chat_input("Ask anything about dam rehabilitation, inspection, or repair..."):
-    handle_prompt(p, collection, top_k, show_sources)
+    handle_prompt(p, top_k, show_sources)
     st.rerun()
