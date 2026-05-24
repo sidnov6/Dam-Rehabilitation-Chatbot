@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Large raw files — not needed in deployment
+Mnul_for_Rhbltn_of_Lrge_Dam.pdf
+assets/hoover.jpg
+assets/sardar.jpg
+assets/tehri.jpg
+assets/itaipu.jpg
+assets/embankment.jpg
+assets/seepage.jpg
+assets/hero.jpg
+assets/bhakra.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
